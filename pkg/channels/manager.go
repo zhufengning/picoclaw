@@ -171,6 +171,8 @@ func (m *Manager) initChannels() error {
 				"error": err.Error(),
 			})
 		} else {
+			onebot.SetProvidersConfig(m.config.Providers)
+			onebot.SetWorkspacePath(m.config.WorkspacePath())
 			m.channels["onebot"] = onebot
 			logger.InfoC("channels", "OneBot channel enabled successfully")
 		}

@@ -149,6 +149,7 @@ type LINEConfig struct {
 
 type OneBotConfig struct {
 	Enabled                        bool                `json:"enabled" env:"PICOCLAW_CHANNELS_ONEBOT_ENABLED"`
+	Debug                          bool                `json:"debug" env:"PICOCLAW_CHANNELS_ONEBOT_DEBUG"`
 	WSUrl                          string              `json:"ws_url" env:"PICOCLAW_CHANNELS_ONEBOT_WS_URL"`
 	AccessToken                    string              `json:"access_token" env:"PICOCLAW_CHANNELS_ONEBOT_ACCESS_TOKEN"`
 	ReconnectInterval              int                 `json:"reconnect_interval" env:"PICOCLAW_CHANNELS_ONEBOT_RECONNECT_INTERVAL"`
@@ -156,6 +157,10 @@ type OneBotConfig struct {
 	GroupContextQueueSize          int                 `json:"group_context_queue_size" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_CONTEXT_QUEUE_SIZE"`
 	GroupRandomReplyProbability    float64             `json:"group_random_reply_probability" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_RANDOM_REPLY_PROBABILITY"`
 	GroupForceReplyIntervalSeconds int                 `json:"group_force_reply_interval_seconds" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_FORCE_REPLY_INTERVAL_SECONDS"`
+	ImageCaptionProvider           string              `json:"image_caption_provider" env:"PICOCLAW_CHANNELS_ONEBOT_IMAGE_CAPTION_PROVIDER"`
+	ImageCaptionModel              string              `json:"image_caption_model" env:"PICOCLAW_CHANNELS_ONEBOT_IMAGE_CAPTION_MODEL"`
+	ImageCaptionPrompt             string              `json:"image_caption_prompt" env:"PICOCLAW_CHANNELS_ONEBOT_IMAGE_CAPTION_PROMPT"`
+	ImageCaptionTimeoutSeconds     int                 `json:"image_caption_timeout_seconds" env:"PICOCLAW_CHANNELS_ONEBOT_IMAGE_CAPTION_TIMEOUT_SECONDS"`
 	AllowGroups                    FlexibleStringSlice `json:"allow_groups" env:"PICOCLAW_CHANNELS_ONEBOT_ALLOW_GROUPS"`
 	AllowFrom                      FlexibleStringSlice `json:"allow_from" env:"PICOCLAW_CHANNELS_ONEBOT_ALLOW_FROM"`
 }

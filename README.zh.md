@@ -19,6 +19,18 @@
 
 ---
 
+## 🔀 与原版 picoclaw 的差异（Fork 说明）
+
+当前仓库包含一组上游默认未提供的 OneBot 定制增强：
+
+- 新增 OneBot 群聊控制与路由行为：`allow_groups`、触发词/@ 处理、群上下文队列、概率/静默超时自动触发回复。
+- OneBot 入站消息会打包为结构化 XML，明确保留排队历史与本次触发消息边界，供 agent 使用。
+- 支持 OneBot `image` 与 `reply` segment；未知 segment 会以 `<segment type="raw_message">...</segment>` 保留。
+- `reply` 会主动调用 OneBot `get_msg` 拉取被引用消息，并把引用元数据/内容写入 XML。
+- 图片与图片描述缓存统一保存在 `<workspace>/tmp/imgs`（不再使用系统临时目录）；描述缓存兼容 hi 侧边文件格式（`<image>.txt`）。
+- 新增 OneBot 调试开关（`channels.onebot.debug`）：对白名单私聊/群聊入站消息输出完整打包 XML。
+- 启动时可额外加载 `~/.picoclaw/.env`（不覆盖已存在的进程环境变量）。
+
 🦐 **PicoClaw** 是一个受 [nanobot](https://github.com/HKUDS/nanobot) 启发的超轻量级个人 AI 助手。它采用 **Go 语言** 从零重构，经历了一个“自举”过程——即由 AI Agent 自身驱动了整个架构迁移和代码优化。
 
 ⚡️ **极致轻量**：可在 **10 美元** 的硬件上运行，内存占用 **<10MB**。这意味着比 OpenClaw 节省 99% 的内存，比 Mac mini 便宜 98%！

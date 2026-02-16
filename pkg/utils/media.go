@@ -51,6 +51,7 @@ type DownloadOptions struct {
 	Timeout      time.Duration
 	ExtraHeaders map[string]string
 	LoggerPrefix string
+	LocalDir     string
 }
 
 // DownloadFile downloads a file from URL to a local temp directory.
@@ -64,7 +65,10 @@ func DownloadFile(url, filename string, opts DownloadOptions) string {
 		opts.LoggerPrefix = "utils"
 	}
 
-	mediaDir := filepath.Join(os.TempDir(), "picoclaw_media")
+	mediaDir := strings.TrimSpace(opts.LocalDir)
+	if mediaDir == "" {
+		mediaDir = filepath.Join(os.TempDir(), "picoclaw_media")
+	}
 	if err := os.MkdirAll(mediaDir, 0700); err != nil {
 		logger.ErrorCF(opts.LoggerPrefix, "Failed to create media directory", map[string]interface{}{
 			"error": err.Error(),

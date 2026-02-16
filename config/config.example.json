@@ -63,6 +63,7 @@
     },
     "onebot": {
       "enabled": false,
+      "debug": false,
       "ws_url": "ws://127.0.0.1:3001",
       "access_token": "",
       "reconnect_interval": 5,
@@ -70,6 +71,10 @@
       "group_context_queue_size": 20,
       "group_random_reply_probability": 0,
       "group_force_reply_interval_seconds": 0,
+      "image_caption_provider": "",
+      "image_caption_model": "",
+      "image_caption_prompt": "请用一句话描述这张图片的主要内容。",
+      "image_caption_timeout_seconds": 30,
       "allow_groups": [],
       "allow_from": []
     }
