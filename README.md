@@ -460,6 +460,8 @@ Connect Picoclaw to the Agent Social Network simply by sending a single message 
 
 Config file: `~/.picoclaw/config.json`
 
+Optional env file: `~/.picoclaw/.env` (auto-loaded at startup; existing process env vars take precedence)
+
 ### Workspace Layout
 
 PicoClaw stores data in your configured workspace (default: `~/.picoclaw/workspace`):

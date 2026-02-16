@@ -120,6 +120,10 @@ func copyDirectory(src, dst string) error {
 }
 
 func main() {
+	if err := loadDefaultEnvFile(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to load env file: %v\n", err)
+	}
+
 	if len(os.Args) < 2 {
 		printHelp()
 		os.Exit(1)
@@ -985,6 +989,172 @@ func authStatusCmd() {
 func getConfigPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".picoclaw", "config.json")
+}
+
+func getDefaultEnvPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".picoclaw", ".env")
+}
+
+func loadDefaultEnvFile() error {
+	return loadEnvFile(getDefaultEnvPath())
+}
+
+func loadEnvFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for lineNo := 1; scanner.Scan(); lineNo++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+
+		key, rawValue, ok := strings.Cut(line, "=")
+		if !ok {
+			return fmt.Errorf("%s:%d invalid line (missing '=')", path, lineNo)
+		}
+
+		key = strings.TrimSpace(key)
+		if !isValidEnvKey(key) {
+			return fmt.Errorf("%s:%d invalid env key: %s", path, lineNo, key)
+		}
+
+		if _, exists := os.LookupEnv(key); exists {
+			continue
+		}
+
+		value, err := parseEnvValue(strings.TrimSpace(rawValue))
+		if err != nil {
+			return fmt.Errorf("%s:%d %w", path, lineNo, err)
+		}
+
+		if err := os.Setenv(key, value); err != nil {
+			return fmt.Errorf("%s:%d set env failed for %s: %w", path, lineNo, key, err)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func isValidEnvKey(key string) bool {
+	if key == "" {
+		return false
+	}
+
+	for i, ch := range key {
+		if i == 0 {
+			if (ch < 'A' || ch > 'Z') && (ch < 'a' || ch > 'z') && ch != '_' {
+				return false
+			}
+			continue
+		}
+
+		if (ch < 'A' || ch > 'Z') && (ch < 'a' || ch > 'z') && (ch < '0' || ch > '9') && ch != '_' {
+			return false
+		}
+	}
+
+	return true
+}
+
+func parseEnvValue(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+
+	if raw[0] == '"' || raw[0] == '\'' {
+		quote := raw[0]
+		end := -1
+		escaped := false
+		for i := 1; i < len(raw); i++ {
+			if quote == '"' && raw[i] == '\\' && !escaped {
+				escaped = true
+				continue
+			}
+			if raw[i] == quote && (!escaped || quote == '\'') {
+				end = i
+				break
+			}
+			escaped = false
+		}
+
+		if end == -1 {
+			return "", fmt.Errorf("unterminated quoted value")
+		}
+
+		rest := strings.TrimSpace(raw[end+1:])
+		if rest != "" && !strings.HasPrefix(rest, "#") {
+			return "", fmt.Errorf("unexpected trailing content after quoted value")
+		}
+
+		value := raw[1:end]
+		if quote == '\'' {
+			return value, nil
+		}
+
+		return unescapeDoubleQuoted(value), nil
+	}
+
+	return stripInlineComment(raw), nil
+}
+
+func unescapeDoubleQuoted(value string) string {
+	var b strings.Builder
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch != '\\' || i+1 >= len(value) {
+			b.WriteByte(ch)
+			continue
+		}
+
+		i++
+		switch value[i] {
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case 't':
+			b.WriteByte('\t')
+		case '\\':
+			b.WriteByte('\\')
+		case '"':
+			b.WriteByte('"')
+		default:
+			b.WriteByte(value[i])
+		}
+	}
+
+	return b.String()
+}
+
+func stripInlineComment(value string) string {
+	for i := 0; i < len(value); i++ {
+		if value[i] != '#' {
+			continue
+		}
+
+		if i == 0 || value[i-1] == ' ' || value[i-1] == '\t' {
+			return strings.TrimSpace(value[:i])
+		}
+	}
+
+	return strings.TrimSpace(value)
 }
 
 func setupCronTool(agentLoop *agent.AgentLoop, msgBus *bus.MessageBus, workspace string, restrict bool) *cron.CronService {

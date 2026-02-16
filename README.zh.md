@@ -420,6 +420,8 @@ picoclaw gateway
 
 配置文件路径: `~/.picoclaw/config.json`
 
+可选环境变量文件: `~/.picoclaw/.env`（启动时自动加载，不覆盖已存在的进程环境变量）
+
 ### 工作区布局 (Workspace Layout)
 
 PicoClaw 将数据存储在您配置的工作区中（默认：`~/.picoclaw/workspace`）：

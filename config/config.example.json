@@ -67,6 +67,10 @@
       "access_token": "",
       "reconnect_interval": 5,
       "group_trigger_prefix": [],
+      "group_context_queue_size": 20,
+      "group_random_reply_probability": 0,
+      "group_force_reply_interval_seconds": 0,
+      "allow_groups": [],
       "allow_from": []
     }
   },

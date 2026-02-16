@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,16 +19,23 @@ import (
 
 type OneBotChannel struct {
 	*BaseChannel
-	config      config.OneBotConfig
-	conn        *websocket.Conn
-	ctx         context.Context
-	cancel      context.CancelFunc
-	dedup       map[string]struct{}
-	dedupRing   []string
-	dedupIdx    int
-	mu          sync.Mutex
-	writeMu     sync.Mutex
-	echoCounter int64
+	config          config.OneBotConfig
+	conn            *websocket.Conn
+	ctx             context.Context
+	cancel          context.CancelFunc
+	dedup           map[string]struct{}
+	dedupRing       []string
+	dedupIdx        int
+	groupPending    map[string][]oneBotQueuedMessage
+	groupQueueLimit int
+	lastGroupReply  map[string]time.Time
+	mu              sync.Mutex
+	pendingMu       sync.Mutex
+	replyMu         sync.Mutex
+	writeMu         sync.Mutex
+	echoCounter     int64
+	randFloat       func() float64
+	nowFunc         func() time.Time
 }
 
 type oneBotRawEvent struct {
@@ -91,16 +99,33 @@ type oneBotSendGroupMsgParams struct {
 	Message string `json:"message"`
 }
 
+type oneBotQueuedMessage struct {
+	SenderID   string
+	SenderName string
+	Content    string
+}
+
 func NewOneBotChannel(cfg config.OneBotConfig, messageBus *bus.MessageBus) (*OneBotChannel, error) {
 	base := NewBaseChannel("onebot", cfg, messageBus, cfg.AllowFrom)
 
 	const dedupSize = 1024
+	const defaultGroupQueueLimit = 20
+	groupQueueLimit := cfg.GroupContextQueueSize
+	if groupQueueLimit <= 0 {
+		groupQueueLimit = defaultGroupQueueLimit
+	}
+
 	return &OneBotChannel{
-		BaseChannel: base,
-		config:      cfg,
-		dedup:       make(map[string]struct{}, dedupSize),
-		dedupRing:   make([]string, dedupSize),
-		dedupIdx:    0,
+		BaseChannel:     base,
+		config:          cfg,
+		dedup:           make(map[string]struct{}, dedupSize),
+		dedupRing:       make([]string, dedupSize),
+		dedupIdx:        0,
+		groupPending:    make(map[string][]oneBotQueuedMessage),
+		groupQueueLimit: groupQueueLimit,
+		lastGroupReply:  make(map[string]time.Time),
+		randFloat:       rand.Float64,
+		nowFunc:         time.Now,
 	}, nil
 }
 
@@ -250,6 +275,10 @@ func (c *OneBotChannel) Send(ctx context.Context, msg bus.OutboundMessage) error
 			"error": err.Error(),
 		})
 		return err
+	}
+
+	if groupID, ok := parseOneBotGroupChatID(msg.ChatID); ok {
+		c.markGroupReplied(groupID)
 	}
 
 	return nil
@@ -563,6 +592,15 @@ func (c *OneBotChannel) handleMessage(evt *oneBotEvent) {
 	}
 
 	senderID := strconv.FormatInt(evt.UserID, 10)
+	if !c.IsAllowed(senderID) {
+		logger.DebugCF("onebot", "Message ignored (sender not allowed)", map[string]interface{}{
+			"sender":     senderID,
+			"message_id": evt.MessageID,
+			"type":       evt.MessageType,
+		})
+		return
+	}
+
 	var chatID string
 
 	metadata := map[string]string{
@@ -581,31 +619,75 @@ func (c *OneBotChannel) handleMessage(evt *oneBotEvent) {
 
 	case "group":
 		groupIDStr := strconv.FormatInt(evt.GroupID, 10)
-		chatID = "group:" + groupIDStr
-		metadata["group_id"] = groupIDStr
+		if !c.isGroupAllowed(groupIDStr) {
+			logger.DebugCF("onebot", "Group message ignored (group not allowed)", map[string]interface{}{
+				"sender":  senderID,
+				"group":   groupIDStr,
+				"content": truncate(content, 100),
+			})
+			return
+		}
 
 		senderUserID, _ := parseJSONInt64(evt.Sender.UserID)
 		if senderUserID > 0 {
 			metadata["sender_user_id"] = strconv.FormatInt(senderUserID, 10)
 		}
 
+		senderName := ""
 		if evt.Sender.Card != "" {
-			metadata["sender_name"] = evt.Sender.Card
+			senderName = evt.Sender.Card
 		} else if evt.Sender.Nickname != "" {
-			metadata["sender_name"] = evt.Sender.Nickname
+			senderName = evt.Sender.Nickname
+		}
+		if senderName != "" {
+			metadata["sender_name"] = senderName
 		}
 
 		triggered, strippedContent := c.checkGroupTrigger(content, evt.IsBotMentioned)
 		if !triggered {
+			autoTriggered, reason := c.shouldAutoReplyGroup(groupIDStr)
+			if autoTriggered {
+				triggered = true
+				strippedContent = strings.TrimSpace(content)
+				metadata["auto_trigger"] = reason
+				logger.InfoCF("onebot", "Group message auto-triggered", map[string]interface{}{
+					"group":   groupIDStr,
+					"sender":  senderID,
+					"reason":  reason,
+					"content": truncate(content, 100),
+				})
+			}
+		}
+		if !triggered {
+			queueSize := c.enqueueGroupMessage(groupIDStr, oneBotQueuedMessage{
+				SenderID:   senderID,
+				SenderName: senderName,
+				Content:    content,
+			})
 			logger.DebugCF("onebot", "Group message ignored (no trigger)", map[string]interface{}{
 				"sender":       senderID,
 				"group":        groupIDStr,
 				"is_mentioned": evt.IsBotMentioned,
+				"queued":       queueSize,
 				"content":      truncate(content, 100),
 			})
 			return
 		}
 		content = strippedContent
+		chatID = "group:" + groupIDStr
+		metadata["group_id"] = groupIDStr
+
+		queued := c.drainGroupMessages(groupIDStr)
+		if len(queued) > 0 {
+			content = buildGroupContextContent(queued, content)
+			logger.InfoCF("onebot", "Merged queued group context", map[string]interface{}{
+				"group":        groupIDStr,
+				"queued_count": len(queued),
+			})
+		}
+		if reason, ok := metadata["auto_trigger"]; ok {
+			content = buildAutoTriggeredGroupContent(content, reason)
+		}
 
 		logger.InfoCF("onebot", "Received group message", map[string]interface{}{
 			"sender":       senderID,
@@ -683,4 +765,142 @@ func (c *OneBotChannel) checkGroupTrigger(content string, isBotMentioned bool) (
 	}
 
 	return false, content
+}
+
+func (c *OneBotChannel) isGroupAllowed(groupID string) bool {
+	if len(c.config.AllowGroups) == 0 {
+		return true
+	}
+
+	for _, allowed := range c.config.AllowGroups {
+		normalized := strings.TrimSpace(strings.TrimPrefix(allowed, "group:"))
+		if normalized == groupID {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (c *OneBotChannel) shouldAutoReplyGroup(groupID string) (bool, string) {
+	maxSilenceSeconds := c.config.GroupForceReplyIntervalSeconds
+	if maxSilenceSeconds > 0 {
+		now := c.nowFunc()
+
+		c.replyMu.Lock()
+		lastReply, exists := c.lastGroupReply[groupID]
+		c.replyMu.Unlock()
+
+		if !exists || now.Sub(lastReply) >= time.Duration(maxSilenceSeconds)*time.Second {
+			return true, "max_silence"
+		}
+	}
+
+	probability := c.config.GroupRandomReplyProbability
+	if probability <= 0 {
+		return false, ""
+	}
+	if probability > 1 {
+		probability = 1
+	}
+
+	if c.randFloat() < probability {
+		return true, "probability"
+	}
+
+	return false, ""
+}
+
+func (c *OneBotChannel) enqueueGroupMessage(groupID string, msg oneBotQueuedMessage) int {
+	content := strings.TrimSpace(msg.Content)
+	if content == "" {
+		return 0
+	}
+	msg.Content = content
+
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+
+	queue := append(c.groupPending[groupID], msg)
+	if len(queue) > c.groupQueueLimit {
+		queue = queue[len(queue)-c.groupQueueLimit:]
+	}
+	c.groupPending[groupID] = queue
+
+	return len(queue)
+}
+
+func (c *OneBotChannel) drainGroupMessages(groupID string) []oneBotQueuedMessage {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+
+	queue := c.groupPending[groupID]
+	if len(queue) == 0 {
+		return nil
+	}
+
+	result := make([]oneBotQueuedMessage, len(queue))
+	copy(result, queue)
+	delete(c.groupPending, groupID)
+
+	return result
+}
+
+func buildGroupContextContent(queued []oneBotQueuedMessage, triggeredContent string) string {
+	if len(queued) == 0 {
+		return strings.TrimSpace(triggeredContent)
+	}
+
+	var b strings.Builder
+	b.WriteString("[Group context before trigger]\n")
+	for i, msg := range queued {
+		label := msg.SenderID
+		if msg.SenderName != "" {
+			label = fmt.Sprintf("%s(%s)", msg.SenderName, msg.SenderID)
+		}
+		fmt.Fprintf(&b, "%d. %s: %s\n", i+1, label, msg.Content)
+	}
+
+	triggeredContent = strings.TrimSpace(triggeredContent)
+	if triggeredContent != "" {
+		b.WriteString("\n[Triggered message]\n")
+		b.WriteString(triggeredContent)
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
+func buildAutoTriggeredGroupContent(content, reason string) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return content
+	}
+
+	note := "[Auto-triggered notice]\nThe following messages may not be explicitly addressed to the bot (no trigger prefix or @ mention). Consider them as ambient group context."
+	if reason != "" {
+		note += "\nReason: " + reason
+	}
+
+	return note + "\n\n" + content
+}
+
+func (c *OneBotChannel) markGroupReplied(groupID string) {
+	if groupID == "" {
+		return
+	}
+
+	c.replyMu.Lock()
+	c.lastGroupReply[groupID] = c.nowFunc()
+	c.replyMu.Unlock()
+}
+
+func parseOneBotGroupChatID(chatID string) (string, bool) {
+	if !strings.HasPrefix(chatID, "group:") {
+		return "", false
+	}
+	groupID := strings.TrimSpace(strings.TrimPrefix(chatID, "group:"))
+	if groupID == "" {
+		return "", false
+	}
+	return groupID, true
 }

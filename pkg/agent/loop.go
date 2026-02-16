@@ -394,7 +394,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 
 	// 7. Optional: summarization
 	if opts.EnableSummary {
-		al.maybeSummarize(opts.SessionKey, opts.Channel, opts.ChatID)
+		al.maybeSummarize(opts.SessionKey)
 	}
 
 	// 8. Optional: send response via bus
@@ -720,7 +720,7 @@ func (al *AgentLoop) updateToolContexts(channel, chatID string) {
 }
 
 // maybeSummarize triggers summarization if the session history exceeds thresholds.
-func (al *AgentLoop) maybeSummarize(sessionKey, channel, chatID string) {
+func (al *AgentLoop) maybeSummarize(sessionKey string) {
 	newHistory := al.sessions.GetHistory(sessionKey)
 	tokenEstimate := al.estimateTokens(newHistory)
 	threshold := al.contextWindow * 75 / 100
@@ -729,14 +729,13 @@ func (al *AgentLoop) maybeSummarize(sessionKey, channel, chatID string) {
 		if _, loading := al.summarizing.LoadOrStore(sessionKey, true); !loading {
 			go func() {
 				defer al.summarizing.Delete(sessionKey)
-				// Notify user about optimization if not an internal channel
-				if !constants.IsInternalChannel(channel) {
-					al.bus.PublishOutbound(bus.OutboundMessage{
-						Channel: channel,
-						ChatID:  chatID,
-						Content: "⚠️ Memory threshold reached. Optimizing conversation history...",
+				logger.InfoCF("agent", "Memory threshold reached. Optimizing conversation history.",
+					map[string]interface{}{
+						"session_key": sessionKey,
+						"messages":    len(newHistory),
+						"tokens":      tokenEstimate,
+						"threshold":   threshold,
 					})
-				}
 				al.summarizeSession(sessionKey)
 			}()
 		}

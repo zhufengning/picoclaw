@@ -148,12 +148,16 @@ type LINEConfig struct {
 }
 
 type OneBotConfig struct {
-	Enabled            bool                `json:"enabled" env:"PICOCLAW_CHANNELS_ONEBOT_ENABLED"`
-	WSUrl              string              `json:"ws_url" env:"PICOCLAW_CHANNELS_ONEBOT_WS_URL"`
-	AccessToken        string              `json:"access_token" env:"PICOCLAW_CHANNELS_ONEBOT_ACCESS_TOKEN"`
-	ReconnectInterval  int                 `json:"reconnect_interval" env:"PICOCLAW_CHANNELS_ONEBOT_RECONNECT_INTERVAL"`
-	GroupTriggerPrefix []string            `json:"group_trigger_prefix" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_TRIGGER_PREFIX"`
-	AllowFrom          FlexibleStringSlice `json:"allow_from" env:"PICOCLAW_CHANNELS_ONEBOT_ALLOW_FROM"`
+	Enabled                        bool                `json:"enabled" env:"PICOCLAW_CHANNELS_ONEBOT_ENABLED"`
+	WSUrl                          string              `json:"ws_url" env:"PICOCLAW_CHANNELS_ONEBOT_WS_URL"`
+	AccessToken                    string              `json:"access_token" env:"PICOCLAW_CHANNELS_ONEBOT_ACCESS_TOKEN"`
+	ReconnectInterval              int                 `json:"reconnect_interval" env:"PICOCLAW_CHANNELS_ONEBOT_RECONNECT_INTERVAL"`
+	GroupTriggerPrefix             []string            `json:"group_trigger_prefix" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_TRIGGER_PREFIX"`
+	GroupContextQueueSize          int                 `json:"group_context_queue_size" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_CONTEXT_QUEUE_SIZE"`
+	GroupRandomReplyProbability    float64             `json:"group_random_reply_probability" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_RANDOM_REPLY_PROBABILITY"`
+	GroupForceReplyIntervalSeconds int                 `json:"group_force_reply_interval_seconds" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_FORCE_REPLY_INTERVAL_SECONDS"`
+	AllowGroups                    FlexibleStringSlice `json:"allow_groups" env:"PICOCLAW_CHANNELS_ONEBOT_ALLOW_GROUPS"`
+	AllowFrom                      FlexibleStringSlice `json:"allow_from" env:"PICOCLAW_CHANNELS_ONEBOT_ALLOW_FROM"`
 }
 
 type HeartbeatConfig struct {
@@ -286,12 +290,16 @@ func DefaultConfig() *Config {
 				AllowFrom:          FlexibleStringSlice{},
 			},
 			OneBot: OneBotConfig{
-				Enabled:            false,
-				WSUrl:              "ws://127.0.0.1:3001",
-				AccessToken:        "",
-				ReconnectInterval:  5,
-				GroupTriggerPrefix: []string{},
-				AllowFrom:          FlexibleStringSlice{},
+				Enabled:                        false,
+				WSUrl:                          "ws://127.0.0.1:3001",
+				AccessToken:                    "",
+				ReconnectInterval:              5,
+				GroupTriggerPrefix:             []string{},
+				GroupContextQueueSize:          20,
+				GroupRandomReplyProbability:    0,
+				GroupForceReplyIntervalSeconds: 0,
+				AllowGroups:                    FlexibleStringSlice{},
+				AllowFrom:                      FlexibleStringSlice{},
 			},
 		},
 		Providers: ProvidersConfig{
