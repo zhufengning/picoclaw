@@ -23,12 +23,13 @@
 
 This repository currently includes several OneBot-focused enhancements not in upstream by default:
 
-- Added OneBot group controls and routing behavior: `allow_groups`, trigger-prefix / @ handling, queued group context, random/forced auto-trigger replies.
+- Added OneBot group controls and routing behavior: `allow_groups`, trigger-prefix / @ handling, queued group context, random/forced auto-trigger replies, auto-reply cooldown (`group_auto_reply_cooldown_messages`), and reply wait window (`group_reply_wait_seconds`).
 - OneBot inbound content is packaged as structured XML for agent context, including queued history and triggered message boundaries.
-- Added OneBot segment handling for `image` and `reply`; unknown segments are preserved as `<segment type="raw_message">...</segment>`.
-- Reply segments now actively fetch quoted message details via OneBot `get_msg`, then embed quoted metadata/content into XML.
-- Images and caption cache are stored under `<workspace>/tmp/imgs` (not system temp); caption sidecar cache is hi-compatible (`<image>.txt`).
-- Added OneBot debug switch (`channels.onebot.debug`) to log full packaged XML for allowed private/group inbound messages.
+- Added OneBot segment handling for `image` and `reply`; unknown segments are preserved as `<segment type="raw_message">...</segment>`, and `reply` now fetches quoted message details via OneBot `get_msg`.
+- XML message text payloads are wrapped with CDATA for better readability by LLMs; image segment no longer includes short-lived OneBot `url` fields.
+- Images and caption cache are stored under `<workspace>/tmp/imgs` (not system temp), deduplicated by file content hash, and caption sidecar cache is hi-compatible (`<image>.txt`) with legacy cache reuse.
+- OneBot now pre-filters allowlist/group whitelist before expensive media/reply enrichment, so disallowed chats do not trigger image download/captioning.
+- Added OneBot debug switch (`channels.onebot.debug`) to log only the final packaged XML right before forwarding to LLM (`stage=llm_forward`).
 - Added optional startup loading of `~/.picoclaw/.env` (without overriding existing process environment variables).
 
 🦐 PicoClaw is an ultra-lightweight personal AI Assistant inspired by [nanobot](https://github.com/HKUDS/nanobot), refactored from the ground up in Go through a self-bootstrapping process, where the AI agent itself drove the entire architectural migration and code optimization.

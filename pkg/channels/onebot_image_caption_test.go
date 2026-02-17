@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -117,6 +118,92 @@ func TestOneBotEnsureImageInWorkspace_CopiesToWorkspaceTmpImgs(t *testing.T) {
 	}
 	if string(gotBytes) != string(wantBytes) {
 		t.Fatalf("copied content mismatch: got=%q want=%q", string(gotBytes), string(wantBytes))
+	}
+}
+
+func TestOneBotEnsureImageInWorkspace_DeduplicatesByContent(t *testing.T) {
+	msgBus := bus.NewMessageBus()
+	ch, err := NewOneBotChannel(config.OneBotConfig{}, msgBus)
+	if err != nil {
+		t.Fatalf("NewOneBotChannel() error = %v", err)
+	}
+
+	workspace := t.TempDir()
+	ch.SetWorkspacePath(workspace)
+
+	imgA := filepath.Join(t.TempDir(), "a.jpg")
+	imgB := filepath.Join(t.TempDir(), "b.png")
+	content := []byte("same-image-bytes")
+	if err := os.WriteFile(imgA, content, 0644); err != nil {
+		t.Fatalf("write image A failed: %v", err)
+	}
+	if err := os.WriteFile(imgB, content, 0644); err != nil {
+		t.Fatalf("write image B failed: %v", err)
+	}
+
+	pathA := ch.ensureImageInWorkspace(imgA, "a.jpg")
+	pathB := ch.ensureImageInWorkspace(imgB, "b.png")
+	if pathA == "" || pathB == "" {
+		t.Fatalf("ensureImageInWorkspace() returned empty path: A=%q B=%q", pathA, pathB)
+	}
+	if pathA != pathB {
+		t.Fatalf("same content should map to same cached image path, got A=%q B=%q", pathA, pathB)
+	}
+
+	files, err := os.ReadDir(filepath.Join(workspace, "tmp", "imgs"))
+	if err != nil {
+		t.Fatalf("read workspace image dir failed: %v", err)
+	}
+	var nonTxt []string
+	for _, f := range files {
+		if f.IsDir() || strings.HasSuffix(strings.ToLower(f.Name()), ".txt") {
+			continue
+		}
+		nonTxt = append(nonTxt, f.Name())
+	}
+	sort.Strings(nonTxt)
+	if len(nonTxt) != 1 {
+		t.Fatalf("expected exactly 1 image file after dedupe, got %d: %v", len(nonTxt), nonTxt)
+	}
+}
+
+func TestOneBotEnsureImageInWorkspace_ReusesLegacyCacheFileByContent(t *testing.T) {
+	msgBus := bus.NewMessageBus()
+	ch, err := NewOneBotChannel(config.OneBotConfig{}, msgBus)
+	if err != nil {
+		t.Fatalf("NewOneBotChannel() error = %v", err)
+	}
+
+	workspace := t.TempDir()
+	ch.SetWorkspacePath(workspace)
+
+	mediaDir := filepath.Join(workspace, "tmp", "imgs")
+	if err := os.MkdirAll(mediaDir, 0755); err != nil {
+		t.Fatalf("create media dir failed: %v", err)
+	}
+	legacyImage := filepath.Join(mediaDir, "legacy-file-name.jpg")
+	legacySummary := "老缓存描述"
+	imageBytes := []byte("legacy-image-bytes")
+	if err := os.WriteFile(legacyImage, imageBytes, 0644); err != nil {
+		t.Fatalf("write legacy image failed: %v", err)
+	}
+	if err := os.WriteFile(legacyImage+".txt", []byte(legacySummary), 0644); err != nil {
+		t.Fatalf("write legacy summary failed: %v", err)
+	}
+
+	srcPath := filepath.Join(t.TempDir(), "incoming.jpg")
+	if err := os.WriteFile(srcPath, imageBytes, 0644); err != nil {
+		t.Fatalf("write source image failed: %v", err)
+	}
+
+	gotPath := ch.ensureImageInWorkspace(srcPath, "incoming.jpg")
+	if gotPath != legacyImage {
+		t.Fatalf("expected reuse of legacy image file path, got %q want %q", gotPath, legacyImage)
+	}
+
+	gotSummary := ch.describeImage(gotPath)
+	if gotSummary != legacySummary {
+		t.Fatalf("describeImage() = %q, want %q", gotSummary, legacySummary)
 	}
 }
 

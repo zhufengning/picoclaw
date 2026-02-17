@@ -157,6 +157,8 @@ type OneBotConfig struct {
 	GroupContextQueueSize          int                 `json:"group_context_queue_size" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_CONTEXT_QUEUE_SIZE"`
 	GroupRandomReplyProbability    float64             `json:"group_random_reply_probability" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_RANDOM_REPLY_PROBABILITY"`
 	GroupForceReplyIntervalSeconds int                 `json:"group_force_reply_interval_seconds" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_FORCE_REPLY_INTERVAL_SECONDS"`
+	GroupAutoReplyCooldownMessages int                 `json:"group_auto_reply_cooldown_messages" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_AUTO_REPLY_COOLDOWN_MESSAGES"`
+	GroupReplyWaitSeconds          int                 `json:"group_reply_wait_seconds" env:"PICOCLAW_CHANNELS_ONEBOT_GROUP_REPLY_WAIT_SECONDS"`
 	ImageCaptionProvider           string              `json:"image_caption_provider" env:"PICOCLAW_CHANNELS_ONEBOT_IMAGE_CAPTION_PROVIDER"`
 	ImageCaptionModel              string              `json:"image_caption_model" env:"PICOCLAW_CHANNELS_ONEBOT_IMAGE_CAPTION_MODEL"`
 	ImageCaptionPrompt             string              `json:"image_caption_prompt" env:"PICOCLAW_CHANNELS_ONEBOT_IMAGE_CAPTION_PROMPT"`
@@ -303,6 +305,8 @@ func DefaultConfig() *Config {
 				GroupContextQueueSize:          20,
 				GroupRandomReplyProbability:    0,
 				GroupForceReplyIntervalSeconds: 0,
+				GroupAutoReplyCooldownMessages: 0,
+				GroupReplyWaitSeconds:          0,
 				AllowGroups:                    FlexibleStringSlice{},
 				AllowFrom:                      FlexibleStringSlice{},
 			},

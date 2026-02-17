@@ -3,11 +3,12 @@ package channels
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	"io"
 	"math/rand"
 	"mime"
 	"net/http"
@@ -42,6 +43,8 @@ type OneBotChannel struct {
 	groupPending    map[string][]oneBotQueuedMessage
 	groupQueueLimit int
 	lastGroupReply  map[string]time.Time
+	groupCooldown   map[string]int
+	groupReplyWait  map[string]*oneBotPendingGroupReply
 	mu              sync.Mutex
 	pendingMu       sync.Mutex
 	replyMu         sync.Mutex
@@ -54,6 +57,9 @@ type OneBotChannel struct {
 	httpClient      *http.Client
 	apiWaiters      map[string]chan oneBotAPIResponse
 	mediaDir        string
+	mediaHashIndex  map[string]string
+	mediaIndexReady bool
+	mediaMu         sync.Mutex
 }
 
 type oneBotRawEvent struct {
@@ -160,6 +166,15 @@ type oneBotQueuedMessage struct {
 	MediaPaths []string
 }
 
+type oneBotPendingGroupReply struct {
+	SenderID          string
+	ChatID            string
+	Metadata          map[string]string
+	Triggered         oneBotQueuedMessage
+	AutoTriggerReason string
+	Version           int64
+}
+
 type oneBotMessageSegment struct {
 	Type         string
 	Text         string
@@ -205,11 +220,14 @@ func NewOneBotChannel(cfg config.OneBotConfig, messageBus *bus.MessageBus) (*One
 		groupPending:    make(map[string][]oneBotQueuedMessage),
 		groupQueueLimit: groupQueueLimit,
 		lastGroupReply:  make(map[string]time.Time),
+		groupCooldown:   make(map[string]int),
+		groupReplyWait:  make(map[string]*oneBotPendingGroupReply),
 		randFloat:       rand.Float64,
 		nowFunc:         time.Now,
 		httpClient:      &http.Client{Timeout: 30 * time.Second},
 		apiWaiters:      make(map[string]chan oneBotAPIResponse),
 		mediaDir:        filepath.Join("tmp", "imgs"),
+		mediaHashIndex:  make(map[string]string),
 	}, nil
 }
 
@@ -222,7 +240,11 @@ func (c *OneBotChannel) SetWorkspacePath(workspacePath string) {
 	if workspacePath == "" {
 		return
 	}
+	c.mediaMu.Lock()
 	c.mediaDir = filepath.Join(workspacePath, "tmp", "imgs")
+	c.mediaHashIndex = make(map[string]string)
+	c.mediaIndexReady = false
+	c.mediaMu.Unlock()
 }
 
 func (c *OneBotChannel) Start(ctx context.Context) error {
@@ -925,16 +947,18 @@ func oneBotFilenameFromURL(rawURL string) string {
 }
 
 func (c *OneBotChannel) downloadImageToWorkspace(rawURL, filename string) string {
+	// Custom downloader is mainly used by tests. Normalize to content-hash path afterward.
 	if c.downloadFile != nil {
 		if localPath := c.downloadFile(rawURL, filename); strings.TrimSpace(localPath) != "" {
-			return localPath
+			return c.normalizeImageIntoWorkspace(localPath, filename)
 		}
 	}
 
-	return utils.DownloadFile(rawURL, filename, utils.DownloadOptions{
+	localPath := utils.DownloadFile(rawURL, filename, utils.DownloadOptions{
 		LoggerPrefix: "onebot",
 		LocalDir:     c.mediaDir,
 	})
+	return c.normalizeImageIntoWorkspace(localPath, filename)
 }
 
 func (c *OneBotChannel) ensureImageInWorkspace(imagePath, filename string) string {
@@ -952,47 +976,7 @@ func (c *OneBotChannel) ensureImageInWorkspace(imagePath, filename string) strin
 		absImagePath = imagePath
 	}
 
-	absMediaDir, err := filepath.Abs(c.mediaDir)
-	if err != nil {
-		absMediaDir = c.mediaDir
-	}
-
-	if oneBotPathInDir(absImagePath, absMediaDir) {
-		return absImagePath
-	}
-
-	if _, err := os.Stat(absImagePath); err != nil {
-		return imagePath
-	}
-
-	name := strings.TrimSpace(filename)
-	if name == "" {
-		name = filepath.Base(absImagePath)
-	}
-	name = utils.SanitizeFilename(name)
-	if name == "" || name == "." {
-		name = "image"
-	}
-
-	if err := os.MkdirAll(absMediaDir, 0700); err != nil {
-		logger.WarnCF("onebot", "Failed to ensure image workspace directory", map[string]interface{}{
-			"dir":   absMediaDir,
-			"error": err.Error(),
-		})
-		return imagePath
-	}
-
-	targetPath := filepath.Join(absMediaDir, oneBotBuildUniqueFilename(name))
-	if err := oneBotCopyFile(absImagePath, targetPath); err != nil {
-		logger.WarnCF("onebot", "Failed to copy image into workspace", map[string]interface{}{
-			"src":   absImagePath,
-			"dst":   targetPath,
-			"error": err.Error(),
-		})
-		return imagePath
-	}
-
-	return targetPath
+	return c.normalizeImageIntoWorkspace(absImagePath, filename)
 }
 
 func oneBotPathInDir(filePath, dir string) bool {
@@ -1003,32 +987,155 @@ func oneBotPathInDir(filePath, dir string) bool {
 	return rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..")
 }
 
-func oneBotBuildUniqueFilename(base string) string {
-	ext := filepath.Ext(base)
-	name := strings.TrimSuffix(base, ext)
-	if name == "" {
-		name = "image"
+func (c *OneBotChannel) normalizeImageIntoWorkspace(localPath, filenameHint string) string {
+	localPath = strings.TrimSpace(localPath)
+	if localPath == "" {
+		return ""
 	}
-	return fmt.Sprintf("%d_%s%s", time.Now().UnixNano(), name, ext)
+
+	absLocalPath, err := filepath.Abs(localPath)
+	if err != nil {
+		absLocalPath = localPath
+	}
+
+	data, err := os.ReadFile(absLocalPath)
+	if err != nil {
+		logger.WarnCF("onebot", "Failed to read image data for normalization", map[string]interface{}{
+			"path":  absLocalPath,
+			"error": err.Error(),
+		})
+		return localPath
+	}
+
+	targetPath := c.storeImageByContent(data, filenameHint, absLocalPath)
+	if targetPath == "" {
+		return localPath
+	}
+
+	absMediaDir, err := filepath.Abs(c.mediaDir)
+	if err != nil {
+		absMediaDir = c.mediaDir
+	}
+
+	if absLocalPath != targetPath && oneBotPathInDir(absLocalPath, absMediaDir) {
+		_ = os.Remove(absLocalPath)
+	}
+
+	return targetPath
 }
 
-func oneBotCopyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
+func (c *OneBotChannel) storeImageByContent(data []byte, filenameHint, sourcePath string) string {
+	if len(data) == 0 {
+		return ""
 	}
-	defer in.Close()
 
-	out, err := os.Create(dst)
+	absMediaDir, err := filepath.Abs(c.mediaDir)
 	if err != nil {
-		return err
+		absMediaDir = c.mediaDir
 	}
-	defer out.Close()
+	if err := os.MkdirAll(absMediaDir, 0700); err != nil {
+		logger.WarnCF("onebot", "Failed to ensure image workspace directory", map[string]interface{}{
+			"dir":   absMediaDir,
+			"error": err.Error(),
+		})
+		return ""
+	}
 
-	if _, err := io.Copy(out, in); err != nil {
-		return err
+	hash := oneBotSHA256Hex(data)
+	c.mediaMu.Lock()
+	defer c.mediaMu.Unlock()
+
+	c.ensureMediaHashIndexLocked(absMediaDir)
+	if existing := strings.TrimSpace(c.mediaHashIndex[hash]); existing != "" {
+		if _, statErr := os.Stat(existing); statErr == nil {
+			return existing
+		}
+		delete(c.mediaHashIndex, hash)
 	}
-	return out.Sync()
+
+	ext := oneBotImageExtFromData(data, filenameHint, sourcePath)
+	targetPath := filepath.Join(absMediaDir, hash+ext)
+	if _, err := os.Stat(targetPath); err == nil {
+		c.mediaHashIndex[hash] = targetPath
+		return targetPath
+	}
+
+	if err := os.WriteFile(targetPath, data, 0600); err != nil {
+		logger.WarnCF("onebot", "Failed to persist image in workspace", map[string]interface{}{
+			"path":  targetPath,
+			"error": err.Error(),
+		})
+		return ""
+	}
+
+	c.mediaHashIndex[hash] = targetPath
+	return targetPath
+}
+
+func (c *OneBotChannel) ensureMediaHashIndexLocked(absMediaDir string) {
+	if c.mediaIndexReady {
+		return
+	}
+
+	entries, err := os.ReadDir(absMediaDir)
+	if err != nil {
+		c.mediaIndexReady = true
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name())
+		if name == "" || strings.HasSuffix(strings.ToLower(name), ".txt") {
+			continue
+		}
+		path := filepath.Join(absMediaDir, name)
+		data, err := os.ReadFile(path)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		hash := oneBotSHA256Hex(data)
+		if _, exists := c.mediaHashIndex[hash]; !exists {
+			c.mediaHashIndex[hash] = path
+		}
+	}
+
+	c.mediaIndexReady = true
+}
+
+func oneBotSHA256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func oneBotImageExtFromData(data []byte, filenameHint, sourcePath string) string {
+	contentType := http.DetectContentType(data)
+	switch contentType {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "image/bmp":
+		return ".bmp"
+	case "image/tiff":
+		return ".tiff"
+	case "image/svg+xml":
+		return ".svg"
+	}
+
+	for _, name := range []string{filenameHint, sourcePath} {
+		ext := strings.ToLower(strings.TrimSpace(filepath.Ext(name)))
+		if ext != "" {
+			return ext
+		}
+	}
+	return ".img"
 }
 
 func (c *OneBotChannel) describeImage(localPath string) string {
@@ -1398,6 +1505,9 @@ func oneBotJoinURL(base, pathPart string) string {
 func (c *OneBotChannel) handleRawEvent(raw *oneBotRawEvent) {
 	switch raw.PostType {
 	case "message":
+		if !c.isRawMessageAllowed(raw) {
+			return
+		}
 		evt, err := c.normalizeMessageEvent(raw)
 		if err != nil {
 			logger.WarnCF("onebot", "Failed to normalize message event", map[string]interface{}{
@@ -1426,6 +1536,57 @@ func (c *OneBotChannel) handleRawEvent(raw *oneBotRawEvent) {
 			"post_type": raw.PostType,
 		})
 	}
+}
+
+func (c *OneBotChannel) isRawMessageAllowed(raw *oneBotRawEvent) bool {
+	if raw == nil {
+		return false
+	}
+
+	userID, err := parseJSONInt64(raw.UserID)
+	if err != nil || userID <= 0 {
+		logger.WarnCF("onebot", "Skip message event with invalid user id", map[string]interface{}{
+			"error": errString(err),
+		})
+		return false
+	}
+	senderID := strconv.FormatInt(userID, 10)
+	if !c.IsAllowed(senderID) {
+		logger.DebugCF("onebot", "Raw message ignored (sender not allowed)", map[string]interface{}{
+			"sender": senderID,
+			"type":   raw.MessageType,
+		})
+		return false
+	}
+
+	if raw.MessageType != "group" {
+		return true
+	}
+
+	groupID, err := parseJSONInt64(raw.GroupID)
+	if err != nil || groupID <= 0 {
+		logger.WarnCF("onebot", "Skip group message event with invalid group id", map[string]interface{}{
+			"error": errString(err),
+		})
+		return false
+	}
+	groupIDStr := strconv.FormatInt(groupID, 10)
+	if !c.isGroupAllowed(groupIDStr) {
+		logger.DebugCF("onebot", "Raw group message ignored (group not allowed)", map[string]interface{}{
+			"sender": senderID,
+			"group":  groupIDStr,
+		})
+		return false
+	}
+
+	return true
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (c *OneBotChannel) normalizeMessageEvent(raw *oneBotRawEvent) (*oneBotEvent, error) {
@@ -1542,6 +1703,9 @@ func (c *OneBotChannel) handleMessage(evt *oneBotEvent) {
 		"message_id":     evt.MessageID,
 		"message_format": "xml",
 	}
+	if evt.Sender.Nickname != "" {
+		metadata["nickname"] = evt.Sender.Nickname
+	}
 
 	senderName := ""
 	if evt.Sender.Card != "" {
@@ -1567,12 +1731,10 @@ func (c *OneBotChannel) handleMessage(evt *oneBotEvent) {
 	case "private":
 		chatID = "private:" + senderID
 		content = buildOneBotMessageXML(currentMsg, "private")
-		c.logDebugXML("private", chatID, "private_received", content)
 		logger.InfoCF("onebot", "Received private message", map[string]interface{}{
 			"sender":     senderID,
 			"message_id": evt.MessageID,
 			"length":     len(content),
-			"content":    truncate(content, 100),
 		})
 
 	case "group":
@@ -1590,46 +1752,51 @@ func (c *OneBotChannel) handleMessage(evt *oneBotEvent) {
 		if senderUserID > 0 {
 			metadata["sender_user_id"] = strconv.FormatInt(senderUserID, 10)
 		}
-
 		if senderName != "" {
 			metadata["sender_name"] = senderName
 		}
 
+		chatID = "group:" + groupIDStr
+		metadata["group_id"] = groupIDStr
+
+		if queued, queueSize := c.enqueueAndExtendPendingGroupReply(groupIDStr, currentMsg); queued {
+			logger.DebugCF("onebot", "Group message queued while waiting pending reply", map[string]interface{}{
+				"sender":  senderID,
+				"group":   groupIDStr,
+				"queued":  queueSize,
+				"content": truncate(content, 100),
+			})
+			return
+		}
+
 		triggered, strippedContent := c.checkGroupTrigger(content, evt.IsBotMentioned)
 		if !triggered {
-			autoTriggered, reason := c.shouldAutoReplyGroup(groupIDStr)
-			if autoTriggered {
-				triggered = true
-				strippedContent = strings.TrimSpace(content)
-				metadata["auto_trigger"] = reason
-				logger.InfoCF("onebot", "Group message auto-triggered", map[string]interface{}{
-					"group":   groupIDStr,
-					"sender":  senderID,
-					"reason":  reason,
-					"content": truncate(content, 100),
+			cooldownBlocked, cooldownRemaining := c.consumeGroupAutoReplyCooldown(groupIDStr)
+			if cooldownBlocked {
+				logger.DebugCF("onebot", "Group auto-reply skipped due cooldown", map[string]interface{}{
+					"group":              groupIDStr,
+					"sender":             senderID,
+					"cooldown_remaining": cooldownRemaining,
+					"content":            truncate(content, 100),
 				})
+			} else {
+				autoTriggered, reason := c.shouldAutoReplyGroup(groupIDStr)
+				if autoTriggered {
+					triggered = true
+					strippedContent = strings.TrimSpace(content)
+					metadata["auto_trigger"] = reason
+					c.startGroupAutoReplyCooldown(groupIDStr)
+					logger.InfoCF("onebot", "Group message auto-triggered", map[string]interface{}{
+						"group":   groupIDStr,
+						"sender":  senderID,
+						"reason":  reason,
+						"content": truncate(content, 100),
+					})
+				}
 			}
 		}
 		if !triggered {
-			queueSize := c.enqueueGroupMessage(groupIDStr, oneBotQueuedMessage{
-				MessageID:  evt.MessageID,
-				SenderID:   senderID,
-				SenderName: senderName,
-				Time:       evt.Time,
-				Content:    content,
-				Segments:   evt.Segments,
-				MediaPaths: evt.MediaPaths,
-			})
-			queuedXML := buildOneBotMessageXML(oneBotQueuedMessage{
-				MessageID:  evt.MessageID,
-				SenderID:   senderID,
-				SenderName: senderName,
-				Time:       evt.Time,
-				Content:    content,
-				Segments:   evt.Segments,
-				MediaPaths: evt.MediaPaths,
-			}, "queued")
-			c.logDebugXML("group", "group:"+groupIDStr, "group_queued", queuedXML)
+			queueSize := c.enqueueGroupMessage(groupIDStr, currentMsg)
 			logger.DebugCF("onebot", "Group message ignored (no trigger)", map[string]interface{}{
 				"sender":       senderID,
 				"group":        groupIDStr,
@@ -1639,21 +1806,47 @@ func (c *OneBotChannel) handleMessage(evt *oneBotEvent) {
 			})
 			return
 		}
-		originalContent := content
+
+		triggeredMsg := currentMsg
+		triggeredMsg.Content = strippedContent
+		if strippedContent != content {
+			triggeredMsg.Segments = overrideTriggeredSegments(triggeredMsg.Segments, strippedContent)
+		}
+		if len(triggeredMsg.Segments) == 0 && strippedContent != "" {
+			triggeredMsg.Segments = []oneBotMessageSegment{{Type: "text", Text: strippedContent}}
+		}
+
+		if started := c.startPendingGroupReply(groupIDStr, oneBotPendingGroupReply{
+			SenderID:          senderID,
+			ChatID:            chatID,
+			Metadata:          cloneStringMap(metadata),
+			Triggered:         triggeredMsg,
+			AutoTriggerReason: metadata["auto_trigger"],
+		}); started {
+			logger.DebugCF("onebot", "Group reply delayed to collect follow-up messages", map[string]interface{}{
+				"sender":       senderID,
+				"group":        groupIDStr,
+				"wait_seconds": c.config.GroupReplyWaitSeconds,
+				"message_id":   evt.MessageID,
+			})
+			return
+		}
+
+		if queued, queueSize := c.enqueueAndExtendPendingGroupReply(groupIDStr, currentMsg); queued {
+			logger.DebugCF("onebot", "Group trigger merged into existing pending reply window", map[string]interface{}{
+				"sender":  senderID,
+				"group":   groupIDStr,
+				"queued":  queueSize,
+				"content": truncate(content, 100),
+			})
+			return
+		}
+
 		content = strippedContent
-		currentMsg.Content = content
-		if content != originalContent {
-			currentMsg.Segments = overrideTriggeredSegments(currentMsg.Segments, content)
-		}
-		if len(currentMsg.Segments) == 0 && content != "" {
-			currentMsg.Segments = []oneBotMessageSegment{{Type: "text", Text: content}}
-		}
-		chatID = "group:" + groupIDStr
-		metadata["group_id"] = groupIDStr
+		currentMsg = triggeredMsg
 
 		queued := c.drainGroupMessages(groupIDStr)
 		content, mediaPaths = buildGroupContextContent(queued, currentMsg, metadata["auto_trigger"])
-		c.logDebugXML("group", chatID, "group_forward", content)
 		if len(queued) > 0 {
 			logger.InfoCF("onebot", "Merged queued group context", map[string]interface{}{
 				"group":        groupIDStr,
@@ -1667,7 +1860,6 @@ func (c *OneBotChannel) handleMessage(evt *oneBotEvent) {
 			"message_id":   evt.MessageID,
 			"is_mentioned": evt.IsBotMentioned,
 			"length":       len(content),
-			"content":      truncate(content, 100),
 		})
 
 	default:
@@ -1679,15 +1871,12 @@ func (c *OneBotChannel) handleMessage(evt *oneBotEvent) {
 		return
 	}
 
-	if evt.Sender.Nickname != "" {
-		metadata["nickname"] = evt.Sender.Nickname
-	}
-
 	logger.DebugCF("onebot", "Forwarding message to bus", map[string]interface{}{
 		"sender_id": senderID,
 		"chat_id":   chatID,
-		"content":   truncate(content, 100),
+		"length":    len(content),
 	})
+	c.logDebugXML(oneBotMessageTypeFromChatID(chatID), chatID, "llm_forward", content)
 
 	c.HandleMessage(senderID, chatID, content, mediaPaths, metadata)
 }
@@ -1707,6 +1896,16 @@ func (c *OneBotChannel) logDebugXML(messageType, chatID, stage, xmlContent strin
 		"stage":        stage,
 		"xml":          xmlContent,
 	})
+}
+
+func oneBotMessageTypeFromChatID(chatID string) string {
+	if strings.HasPrefix(chatID, "group:") {
+		return "group"
+	}
+	if strings.HasPrefix(chatID, "private:") {
+		return "private"
+	}
+	return ""
 }
 
 func (c *OneBotChannel) isDuplicate(messageID string) bool {
@@ -1798,6 +1997,144 @@ func (c *OneBotChannel) shouldAutoReplyGroup(groupID string) (bool, string) {
 	}
 
 	return false, ""
+}
+
+func (c *OneBotChannel) startGroupAutoReplyCooldown(groupID string) {
+	cooldown := c.config.GroupAutoReplyCooldownMessages
+	if groupID == "" || cooldown <= 0 {
+		return
+	}
+
+	c.replyMu.Lock()
+	c.groupCooldown[groupID] = cooldown
+	c.replyMu.Unlock()
+}
+
+func (c *OneBotChannel) consumeGroupAutoReplyCooldown(groupID string) (blocked bool, remaining int) {
+	if groupID == "" || c.config.GroupAutoReplyCooldownMessages <= 0 {
+		return false, 0
+	}
+
+	c.replyMu.Lock()
+	defer c.replyMu.Unlock()
+
+	remaining = c.groupCooldown[groupID]
+	if remaining <= 0 {
+		return false, 0
+	}
+
+	remaining--
+	if remaining <= 0 {
+		delete(c.groupCooldown, groupID)
+		return true, 0
+	}
+
+	c.groupCooldown[groupID] = remaining
+	return true, remaining
+}
+
+func (c *OneBotChannel) startPendingGroupReply(groupID string, pending oneBotPendingGroupReply) bool {
+	waitSeconds := c.config.GroupReplyWaitSeconds
+	if groupID == "" || waitSeconds <= 0 {
+		return false
+	}
+
+	c.replyMu.Lock()
+	if _, exists := c.groupReplyWait[groupID]; exists {
+		c.replyMu.Unlock()
+		return false
+	}
+
+	pending.Version = 1
+	c.groupReplyWait[groupID] = &pending
+	version := pending.Version
+	c.replyMu.Unlock()
+
+	go c.waitAndDispatchPendingGroupReply(groupID, version, waitSeconds)
+	return true
+}
+
+func (c *OneBotChannel) enqueueAndExtendPendingGroupReply(groupID string, msg oneBotQueuedMessage) (bool, int) {
+	waitSeconds := c.config.GroupReplyWaitSeconds
+	if groupID == "" || waitSeconds <= 0 {
+		return false, 0
+	}
+
+	c.replyMu.Lock()
+	pending, exists := c.groupReplyWait[groupID]
+	if !exists {
+		c.replyMu.Unlock()
+		return false, 0
+	}
+	pending.Version++
+	version := pending.Version
+	c.replyMu.Unlock()
+
+	queueSize := c.enqueueGroupMessage(groupID, msg)
+	go c.waitAndDispatchPendingGroupReply(groupID, version, waitSeconds)
+	return true, queueSize
+}
+
+func (c *OneBotChannel) waitAndDispatchPendingGroupReply(groupID string, version int64, waitSeconds int) {
+	if waitSeconds <= 0 {
+		return
+	}
+
+	timer := time.NewTimer(time.Duration(waitSeconds) * time.Second)
+	defer timer.Stop()
+
+	var done <-chan struct{}
+	if c.ctx != nil {
+		done = c.ctx.Done()
+	}
+
+	select {
+	case <-timer.C:
+	case <-done:
+		return
+	}
+
+	c.replyMu.Lock()
+	pending, exists := c.groupReplyWait[groupID]
+	if !exists || pending.Version != version {
+		c.replyMu.Unlock()
+		return
+	}
+	delete(c.groupReplyWait, groupID)
+
+	chatID := pending.ChatID
+	senderID := pending.SenderID
+	triggered := pending.Triggered
+	autoTriggerReason := pending.AutoTriggerReason
+	metadata := cloneStringMap(pending.Metadata)
+	c.replyMu.Unlock()
+
+	queued := c.drainGroupMessages(groupID)
+	content, mediaPaths := buildGroupContextContent(queued, triggered, autoTriggerReason)
+	c.logDebugXML("group", chatID, "llm_forward", content)
+
+	if len(queued) > 0 {
+		logger.InfoCF("onebot", "Merged queued group context", map[string]interface{}{
+			"group":        groupID,
+			"queued_count": len(queued),
+		})
+	}
+
+	logger.InfoCF("onebot", "Received group message", map[string]interface{}{
+		"sender":       senderID,
+		"group":        groupID,
+		"message_id":   triggered.MessageID,
+		"is_mentioned": false,
+		"length":       len(content),
+	})
+
+	logger.DebugCF("onebot", "Forwarding message to bus", map[string]interface{}{
+		"sender_id": senderID,
+		"chat_id":   chatID,
+		"length":    len(content),
+	})
+
+	c.HandleMessage(senderID, chatID, content, mediaPaths, metadata)
 }
 
 func (c *OneBotChannel) enqueueGroupMessage(groupID string, msg oneBotQueuedMessage) int {
@@ -1900,12 +2237,11 @@ func buildOneBotMessageXML(msg oneBotQueuedMessage, role string) string {
 	for _, seg := range msg.Segments {
 		switch seg.Type {
 		case "text":
-			text := strings.TrimSpace(seg.Text)
-			if text == "" {
+			if strings.TrimSpace(seg.Text) == "" {
 				continue
 			}
 			b.WriteString("  <segment type=\"text\">")
-			b.WriteString(oneBotXMLEscape(text))
+			oneBotWriteCDATA(&b, seg.Text)
 			b.WriteString("</segment>\n")
 		case "at":
 			b.WriteString("  <segment type=\"at\"")
@@ -1920,11 +2256,6 @@ func buildOneBotMessageXML(msg oneBotQueuedMessage, role string) string {
 			b.WriteString(" />\n")
 		case "image":
 			b.WriteString("  <segment type=\"image\"")
-			if seg.ImageURL != "" {
-				b.WriteString(" url=\"")
-				b.WriteString(oneBotXMLEscape(seg.ImageURL))
-				b.WriteString("\"")
-			}
 			if seg.ImageFile != "" {
 				b.WriteString(" file=\"")
 				b.WriteString(oneBotXMLEscape(seg.ImageFile))
@@ -1938,12 +2269,12 @@ func buildOneBotMessageXML(msg oneBotQueuedMessage, role string) string {
 			b.WriteString(">\n")
 			if seg.ImagePath != "" {
 				b.WriteString("    <local_path>")
-				b.WriteString(oneBotXMLEscape(seg.ImagePath))
+				oneBotWriteCDATA(&b, seg.ImagePath)
 				b.WriteString("</local_path>\n")
 			}
 			if seg.ImageSummary != "" {
 				b.WriteString("    <summary>")
-				b.WriteString(oneBotXMLEscape(seg.ImageSummary))
+				oneBotWriteCDATA(&b, seg.ImageSummary)
 				b.WriteString("</summary>\n")
 			}
 			b.WriteString("  </segment>\n")
@@ -1976,20 +2307,19 @@ func buildOneBotMessageXML(msg oneBotQueuedMessage, role string) string {
 				b.WriteString("\"")
 			}
 			b.WriteString(">")
-			b.WriteString(oneBotXMLEscape(seg.ReplyText))
+			oneBotWriteCDATA(&b, seg.ReplyText)
 			b.WriteString("</quoted>\n")
 			b.WriteString("  </segment>\n")
 		case "raw_message":
-			rawText := strings.TrimSpace(seg.Raw)
-			if rawText == "" {
+			if strings.TrimSpace(seg.Raw) == "" {
 				continue
 			}
 			b.WriteString("  <segment type=\"raw_message\">")
-			b.WriteString(oneBotXMLEscape(rawText))
+			oneBotWriteCDATA(&b, seg.Raw)
 			b.WriteString("</segment>\n")
 		default:
 			b.WriteString("  <segment type=\"unknown\">")
-			b.WriteString(oneBotXMLEscape(strings.TrimSpace(seg.Raw)))
+			oneBotWriteCDATA(&b, seg.Raw)
 			b.WriteString("</segment>\n")
 		}
 	}
@@ -2007,6 +2337,16 @@ func oneBotXMLEscape(s string) string {
 	return b.String()
 }
 
+func oneBotWriteCDATA(b *strings.Builder, s string) {
+	if b == nil {
+		return
+	}
+	s = strings.ReplaceAll(s, "]]>", "]]]]><![CDATA[>")
+	b.WriteString("<![CDATA[")
+	b.WriteString(s)
+	b.WriteString("]]>")
+}
+
 func oneBotIndentLines(s string, spaces int) string {
 	prefix := strings.Repeat(" ", spaces)
 	lines := strings.Split(s, "\n")
@@ -2014,6 +2354,18 @@ func oneBotIndentLines(s string, spaces int) string {
 		lines[i] = prefix + line
 	}
 	return strings.Join(lines, "\n")
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return map[string]string{}
+	}
+
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 func extractReplyIDs(segments []oneBotMessageSegment) []string {

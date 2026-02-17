@@ -2,7 +2,9 @@ package channels
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,6 +89,56 @@ func TestOneBotHandleMessage_GroupAllowedWithPrefixFormat(t *testing.T) {
 
 	if _, ok := msgBus.ConsumeInbound(ctx); !ok {
 		t.Fatal("expected inbound message, got none")
+	}
+}
+
+func TestOneBotHandleRawEvent_GroupNotAllowedSkipsImageDownload(t *testing.T) {
+	msgBus := bus.NewMessageBus()
+	ch, err := NewOneBotChannel(config.OneBotConfig{
+		AllowGroups: config.FlexibleStringSlice{"1001"},
+	}, msgBus)
+	if err != nil {
+		t.Fatalf("NewOneBotChannel() error = %v", err)
+	}
+
+	var downloadCalls int32
+	ch.downloadFile = func(url, filename string) string {
+		atomic.AddInt32(&downloadCalls, 1)
+		return ""
+	}
+
+	segments := []map[string]interface{}{
+		{
+			"type": "image",
+			"data": map[string]interface{}{
+				"url":  "https://example.com/a.jpg",
+				"file": "a.jpg",
+			},
+		},
+	}
+	messageJSON, err := json.Marshal(segments)
+	if err != nil {
+		t.Fatalf("marshal message segments failed: %v", err)
+	}
+
+	ch.handleRawEvent(&oneBotRawEvent{
+		PostType:    "message",
+		MessageType: "group",
+		MessageID:   json.RawMessage(`"raw-g1"`),
+		UserID:      json.RawMessage(`2002`),
+		GroupID:     json.RawMessage(`1002`),
+		RawMessage:  `[CQ:image,file=a.jpg,url=https://example.com/a.jpg]`,
+		Message:     messageJSON,
+	})
+
+	if atomic.LoadInt32(&downloadCalls) != 0 {
+		t.Fatalf("downloadFile should not be called for non-allowed groups, got %d", downloadCalls)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	if msg, ok := msgBus.ConsumeInbound(ctx); ok {
+		t.Fatalf("unexpected inbound message: %+v", msg)
 	}
 }
 
@@ -341,6 +393,245 @@ func TestOneBotHandleMessage_GroupProbabilityTriggerMergesQueuedContext(t *testi
 	}
 }
 
+func TestOneBotHandleMessage_GroupAutoReplyCooldownBlocksProbability(t *testing.T) {
+	msgBus := bus.NewMessageBus()
+	ch, err := NewOneBotChannel(config.OneBotConfig{
+		GroupTriggerPrefix:             []string{"/ai"},
+		GroupRandomReplyProbability:    1,
+		GroupAutoReplyCooldownMessages: 2,
+	}, msgBus)
+	if err != nil {
+		t.Fatalf("NewOneBotChannel() error = %v", err)
+	}
+
+	ch.handleMessage(&oneBotEvent{
+		MessageType:    "group",
+		MessageID:      "cd1",
+		UserID:         2002,
+		GroupID:        1001,
+		Content:        "第一条，触发自动回复",
+		IsBotMentioned: false,
+	})
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel1()
+	first, ok := msgBus.ConsumeInbound(ctx1)
+	if !ok {
+		t.Fatal("expected first inbound auto-trigger message")
+	}
+	if first.Metadata["auto_trigger"] != "probability" {
+		t.Fatalf("first auto_trigger = %q, want %q", first.Metadata["auto_trigger"], "probability")
+	}
+
+	ch.handleMessage(&oneBotEvent{
+		MessageType:    "group",
+		MessageID:      "cd2",
+		UserID:         2002,
+		GroupID:        1001,
+		Content:        "第二条，冷却中不该触发",
+		IsBotMentioned: false,
+	})
+	ch.handleMessage(&oneBotEvent{
+		MessageType:    "group",
+		MessageID:      "cd3",
+		UserID:         2002,
+		GroupID:        1001,
+		Content:        "第三条，冷却中不该触发",
+		IsBotMentioned: false,
+	})
+
+	noMsgCtx, noMsgCancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer noMsgCancel()
+	if msg, ok := msgBus.ConsumeInbound(noMsgCtx); ok {
+		t.Fatalf("unexpected inbound message during cooldown: %+v", msg)
+	}
+
+	ch.handleMessage(&oneBotEvent{
+		MessageType:    "group",
+		MessageID:      "cd4",
+		UserID:         2002,
+		GroupID:        1001,
+		Content:        "第四条，冷却结束应再次触发",
+		IsBotMentioned: false,
+	})
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel2()
+	fourth, ok := msgBus.ConsumeInbound(ctx2)
+	if !ok {
+		t.Fatal("expected inbound message after cooldown")
+	}
+	if fourth.Metadata["auto_trigger"] != "probability" {
+		t.Fatalf("fourth auto_trigger = %q, want %q", fourth.Metadata["auto_trigger"], "probability")
+	}
+	if !strings.Contains(fourth.Content, "第二条，冷却中不该触发") || !strings.Contains(fourth.Content, "第三条，冷却中不该触发") {
+		t.Fatalf("expected cooldown-period messages queued into context, got: %q", fourth.Content)
+	}
+}
+
+func TestOneBotHandleMessage_GroupAutoReplyCooldownStillAllowsTrigger(t *testing.T) {
+	msgBus := bus.NewMessageBus()
+	ch, err := NewOneBotChannel(config.OneBotConfig{
+		GroupTriggerPrefix:             []string{"/ai"},
+		GroupRandomReplyProbability:    1,
+		GroupAutoReplyCooldownMessages: 3,
+	}, msgBus)
+	if err != nil {
+		t.Fatalf("NewOneBotChannel() error = %v", err)
+	}
+
+	ch.handleMessage(&oneBotEvent{
+		MessageType:    "group",
+		MessageID:      "ct1",
+		UserID:         2002,
+		GroupID:        1001,
+		Content:        "普通消息先触发自动回复",
+		IsBotMentioned: false,
+	})
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel1()
+	if _, ok := msgBus.ConsumeInbound(ctx1); !ok {
+		t.Fatal("expected first inbound auto-trigger message")
+	}
+
+	ch.handleMessage(&oneBotEvent{
+		MessageType:    "group",
+		MessageID:      "ct2",
+		UserID:         2002,
+		GroupID:        1001,
+		Content:        "/ai 这是显式触发",
+		IsBotMentioned: false,
+	})
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel2()
+	second, ok := msgBus.ConsumeInbound(ctx2)
+	if !ok {
+		t.Fatal("expected explicit trigger message during cooldown")
+	}
+	if second.Metadata["auto_trigger"] != "" {
+		t.Fatalf("explicit trigger should not be marked auto_trigger, got: %q", second.Metadata["auto_trigger"])
+	}
+	if !strings.Contains(second.Content, "这是显式触发") {
+		t.Fatalf("expected explicit trigger content kept, got: %q", second.Content)
+	}
+}
+
+func TestOneBotHandleMessage_GroupReplyWaitCollectsFollowUpMessages(t *testing.T) {
+	msgBus := bus.NewMessageBus()
+	ch, err := NewOneBotChannel(config.OneBotConfig{
+		GroupTriggerPrefix:    []string{"/ai"},
+		GroupContextQueueSize: 20,
+		GroupReplyWaitSeconds: 1,
+	}, msgBus)
+	if err != nil {
+		t.Fatalf("NewOneBotChannel() error = %v", err)
+	}
+
+	ch.handleMessage(&oneBotEvent{
+		MessageType:    "group",
+		MessageID:      "w1",
+		UserID:         2002,
+		GroupID:        1001,
+		Content:        "触发前上下文",
+		IsBotMentioned: false,
+	})
+
+	ch.handleMessage(&oneBotEvent{
+		MessageType:    "group",
+		MessageID:      "w2",
+		UserID:         2002,
+		GroupID:        1001,
+		Content:        "/ai 开始分析",
+		IsBotMentioned: false,
+	})
+
+	earlyCtx, earlyCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer earlyCancel()
+	if msg, ok := msgBus.ConsumeInbound(earlyCtx); ok {
+		t.Fatalf("unexpected inbound message before wait window ends: %+v", msg)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	ch.handleMessage(&oneBotEvent{
+		MessageType:    "group",
+		MessageID:      "w3",
+		UserID:         2003,
+		GroupID:        1001,
+		Content:        "补充说明",
+		IsBotMentioned: false,
+	})
+
+	stillWaitingCtx, stillWaitingCancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer stillWaitingCancel()
+	if msg, ok := msgBus.ConsumeInbound(stillWaitingCtx); ok {
+		t.Fatalf("unexpected inbound message before restarted wait window ends: %+v", msg)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1700*time.Millisecond)
+	defer cancel()
+	msg, ok := msgBus.ConsumeInbound(ctx)
+	if !ok {
+		t.Fatal("expected inbound message after wait window")
+	}
+
+	if msg.ChatID != "group:1001" {
+		t.Fatalf("chat_id = %q, want %q", msg.ChatID, "group:1001")
+	}
+	if !strings.Contains(msg.Content, "触发前上下文") || !strings.Contains(msg.Content, "开始分析") || !strings.Contains(msg.Content, "补充说明") {
+		t.Fatalf("expected merged queued+triggered+follow-up messages, got: %q", msg.Content)
+	}
+}
+
+func TestOneBotHandleMessage_GroupReplyWaitKeepsOriginalAutoTriggerReason(t *testing.T) {
+	msgBus := bus.NewMessageBus()
+	ch, err := NewOneBotChannel(config.OneBotConfig{
+		GroupTriggerPrefix:          []string{"/ai"},
+		GroupRandomReplyProbability: 1,
+		GroupReplyWaitSeconds:       1,
+	}, msgBus)
+	if err != nil {
+		t.Fatalf("NewOneBotChannel() error = %v", err)
+	}
+
+	ch.handleMessage(&oneBotEvent{
+		MessageType:    "group",
+		MessageID:      "wr1",
+		UserID:         2002,
+		GroupID:        1001,
+		Content:        "概率触发的第一条",
+		IsBotMentioned: false,
+	})
+
+	time.Sleep(200 * time.Millisecond)
+	ch.handleMessage(&oneBotEvent{
+		MessageType:    "group",
+		MessageID:      "wr2",
+		UserID:         2002,
+		GroupID:        1001,
+		Content:        "/ai 后续显式触发不应改原因",
+		IsBotMentioned: false,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1700*time.Millisecond)
+	defer cancel()
+	msg, ok := msgBus.ConsumeInbound(ctx)
+	if !ok {
+		t.Fatal("expected inbound message after wait window")
+	}
+
+	if msg.Metadata["auto_trigger"] != "probability" {
+		t.Fatalf("auto_trigger = %q, want %q", msg.Metadata["auto_trigger"], "probability")
+	}
+	if !strings.Contains(msg.Content, "后续显式触发不应改原因") {
+		t.Fatalf("expected follow-up message merged into context, got: %q", msg.Content)
+	}
+	if !strings.Contains(msg.Content, "<auto_trigger_notice") {
+		t.Fatalf("expected auto-trigger notice to keep original reason, got: %q", msg.Content)
+	}
+}
+
 func TestOneBotHandleMessage_PrivateXMLIncludesImageAndReply(t *testing.T) {
 	msgBus := bus.NewMessageBus()
 	ch, err := NewOneBotChannel(config.OneBotConfig{}, msgBus)
@@ -383,13 +674,13 @@ func TestOneBotHandleMessage_PrivateXMLIncludesImageAndReply(t *testing.T) {
 	if len(msg.Media) != 1 || msg.Media[0] != "/tmp/picoclaw_media/test.jpg" {
 		t.Fatalf("media = %#v, want image path", msg.Media)
 	}
-	if !strings.Contains(msg.Content, "<segment type=\"image\"") || !strings.Contains(msg.Content, "<local_path>/tmp/picoclaw_media/test.jpg</local_path>") {
+	if !strings.Contains(msg.Content, "<segment type=\"image\"") || !strings.Contains(msg.Content, "<local_path><![CDATA[/tmp/picoclaw_media/test.jpg]]></local_path>") {
 		t.Fatalf("expected image xml segment in content, got: %q", msg.Content)
 	}
 	if !strings.Contains(msg.Content, "<segment type=\"reply\" id=\"42\">") || !strings.Contains(msg.Content, "<quoted sender_id=\"10086\" sender_name=\"Alice\"") {
 		t.Fatalf("expected expanded reply xml segment in content, got: %q", msg.Content)
 	}
-	if !strings.Contains(msg.Content, "<segment type=\"raw_message\">[CQ:unknown,data=x]</segment>") {
+	if !strings.Contains(msg.Content, "<segment type=\"raw_message\"><![CDATA[[CQ:unknown,data=x]]]></segment>") {
 		t.Fatalf("expected raw_message xml segment in content, got: %q", msg.Content)
 	}
 }
